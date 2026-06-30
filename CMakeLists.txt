@@ -19,6 +19,8 @@ add_executable(SiCom
     mainwindow.cpp
     mainwindow.ui
     sendscheduler.h sendscheduler.cpp
+    LogEntry.h
+    filemanager.h filemanager.cpp
 
 
 )

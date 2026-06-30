@@ -3,6 +3,10 @@
 #include "SerialManager.h"
 #include "dataconvertor.h"
 #include "sendscheduler.h"
+#include "filemanager.h"
+#include "LogEntry.h"
+#include <QTimer>
+#include <QList>
 
 QT_BEGIN_NAMESPACE
 namespace Ui { class MainWindow; }
@@ -41,13 +45,33 @@ private slots:
     void onSchedulerFinished();
     void onSchedulerProgress(int sent, int total);
 
+    //FileManager Slots
+    void onAutoLogToggled();
+    void onBrowseFileClicked();
+    void onSendFileClicked();
+    void onStopFileSendClicked();
+    void onFileSendModeChanged(int index);   // All at once vs Line by line
+    void onFileModeChanged(int index);       // Text vs Binary
+    void onFileSendTick();                   // timer tick — sends next line/chunk
+    void onLoggingStarted(const QString &path);
+    void onLoggingStopped();
+
 private:
     void setupCombos();
     void appendToLog(const QString &direction, const QByteArray &data);
     DataConverter::Format currentSendFormat()    const;
     DataConverter::Format currentDisplayFormat() const;
 
+    //FileManager Private Methods
+    void updateFilePreview();   // reads first bytes of selected file into filePreviewLabel
+    void onFileSendComplete();
+
     Ui::MainWindow  *ui;
     SerialManager   *m_serial;
     SendScheduler *m_scheduler;
+
+    //FileManager Private members
+    FileManager     *m_fileManager;
+    QTimer          *m_fileSendTimer;
+    QList<LogEntry>  m_logEntries;   // full log history for snapshot save
 };

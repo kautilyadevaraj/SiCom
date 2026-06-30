@@ -10,9 +10,12 @@ MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
     , ui(new Ui::MainWindow)
     , m_serial(new SerialManager(this))
+    , m_scheduler(new SendScheduler(this))
+    , m_fileManager(new FileManager(this))
+    , m_fileSendTimer(new QTimer(this))
 {
     ui->setupUi(this);
-    setWindowTitle("Serial Terminal");
+    setWindowTitle("SiCom");
     setupCombos();
 
     // ── UI → slots ───────────────────────────────────────────────────────
@@ -64,6 +67,40 @@ MainWindow::MainWindow(QWidget *parent)
     connect(m_scheduler, &SendScheduler::progressUpdated,
             this, &MainWindow::onSchedulerProgress);
 
+    // File Manager slots
+    // Log panel
+    connect(ui->autoLogButton,  &QPushButton::clicked,
+            this, &MainWindow::onAutoLogToggled);
+    // Note: saveLogButton was connected in P1 but pointed to a stub.
+
+    // File send panel
+    connect(ui->browseButton,       &QPushButton::clicked,
+            this, &MainWindow::onBrowseFileClicked);
+    connect(ui->sendFileButton,     &QPushButton::clicked,
+            this, &MainWindow::onSendFileClicked);
+    connect(ui->stopFileSendButton, &QPushButton::clicked,
+            this, &MainWindow::onStopFileSendClicked);
+    connect(ui->sendModeComboBox,   &QComboBox::currentIndexChanged,
+            this, &MainWindow::onFileSendModeChanged);
+    // Qt5: QOverload<int>::of(&QComboBox::currentIndexChanged)
+    connect(ui->fileModeComboBox,   &QComboBox::currentIndexChanged,
+            this, &MainWindow::onFileModeChanged);
+    // Qt5: same QOverload pattern
+
+    // File send timer → tick slot
+    connect(m_fileSendTimer, &QTimer::timeout,
+            this, &MainWindow::onFileSendTick);
+
+    // FileManager feedback → UI
+    connect(m_fileManager, &FileManager::loggingStarted,
+            this, &MainWindow::onLoggingStarted);
+    connect(m_fileManager, &FileManager::loggingStopped,
+            this, &MainWindow::onLoggingStopped);
+    connect(m_fileManager, &FileManager::loggingError,
+            this, [this](const QString &msg){
+                statusBar()->showMessage("Log error: " + msg, 4000);
+            });
+
     // ── Initial state ─────────────────────────────────────────────────────
     onRefreshClicked();                 // populate port list on startup
     onConnectionChanged(false);         // set all widgets to disconnected state
@@ -73,6 +110,11 @@ MainWindow::MainWindow(QWidget *parent)
     ui->intervalSpinBox->setVisible(false);
     ui->burstLabel->setVisible(false);
     ui->burstCountSpinBox->setVisible(false);
+
+    //Hide file send interval controls
+    ui->fileSendIntervalLabel->setVisible(false);
+    ui->fileSendIntervalSpinBox->setVisible(false);
+    ui->fileSendProgressBar->setVisible(false);
 }
 
 MainWindow::~MainWindow() { delete ui; }
@@ -96,7 +138,6 @@ void MainWindow::setupCombos() {
     ui->sendFormatComboBox->addItems(fmts);
     ui->displayFormatComboBox->addItems(fmts);
 
-    m_scheduler = new SendScheduler(this);
     // Send Scheduler combo setup
     ui->scheduleModeComboBox->addItems({"Once" , "Interval" , "Burst"});
     ui->scheduleModeComboBox->setCurrentIndex(0);
@@ -155,11 +196,62 @@ void MainWindow::onConnectClicked() {
 
 // ── Log panel slots ───────────────────────────────────────────────────────────
 
-void MainWindow::onClearLogClicked() { ui->logTextEdit->clear(); }
+void MainWindow::onClearLogClicked() {
+    if (m_fileManager->isLogging()) {
+        QMessageBox msgBox(this);
+        msgBox.setWindowTitle("Clear Log");
+        msgBox.setText("Auto-logging is active. What should be cleared?");
+        QPushButton *btnDisplay = msgBox.addButton("Display only",       QMessageBox::AcceptRole);
+        QPushButton *btnBoth    = msgBox.addButton("Display and file",   QMessageBox::DestructiveRole);
+        msgBox.addButton("Cancel",             QMessageBox::RejectRole);
+        msgBox.exec();
+
+        if (msgBox.clickedButton() == btnDisplay) {
+            // Clear the UI only — the log file keeps everything written so far
+            ui->logTextEdit->clear();
+            m_logEntries.clear();
+            ui->entryCountLabel->setText("0 entries");
+
+        } else if (msgBox.clickedButton() == btnBoth) {
+            // Clear UI AND truncate the file by restarting in overwrite mode
+            QString path     = m_fileManager->currentLogPath();
+            auto    fmt      = m_fileManager->currentLogFormat();
+            m_fileManager->stopLogging();               // flushes and closes file
+            ui->logTextEdit->clear();
+            m_logEntries.clear();
+            ui->entryCountLabel->setText("0 entries");
+            m_fileManager->startLogging(path, fmt, false); // false = overwrite
+        }
+        // Cancel: fall through and do nothing
+        return;
+    }
+
+    // Not logging — no dialog needed, just clear
+    ui->logTextEdit->clear();
+    m_logEntries.clear();
+    ui->entryCountLabel->setText("0 entries");
+}
 
 void MainWindow::onSaveLogClicked() {
-    // TODO: Phase 4 — FileManager::startLogging / stopLogging
-    statusBar()->showMessage("Save log: coming in Phase 4.", 3000);
+    if (m_logEntries.isEmpty()) {
+        statusBar()->showMessage("Nothing to save.", 2000); return;
+    }
+    // Default filename includes timestamp so files don't accidentally overwrite each other
+    QString defaultName = QDir::homePath() + "/log_" +
+                          QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss");
+    QString path = QFileDialog::getSaveFileName(
+        this, "Save Log", defaultName,
+        "Text Files (*.txt);;CSV Files (*.csv);;All Files (*)");
+    if (path.isEmpty()) return;
+
+    FileManager::LogFormat fmt = path.endsWith(".csv", Qt::CaseInsensitive)
+                                     ? FileManager::LogFormat::CSV
+                                     : FileManager::LogFormat::PlainText;
+
+    if (m_fileManager->saveSnapshot(path, fmt, m_logEntries, currentDisplayFormat()))
+        statusBar()->showMessage("Saved: " + path, 4000);
+    else
+        QMessageBox::critical(this, "Save Failed", "Could not write to file.");
 }
 
 // ── Send panel slots ──────────────────────────────────────────────────────────
@@ -269,6 +361,14 @@ void MainWindow::onConnectionChanged(bool isOpen) {
     ui->stopSendButton->setEnabled(false);   // always off on connect/disconnect
     if (!isOpen && m_scheduler->isRunning()) // device unplugged mid-send
         m_scheduler->stop();
+
+    // Disable file send if disconnected mid-send
+    if (!isOpen && m_fileSendTimer->isActive()) {
+        m_fileSendTimer->stop();
+        onFileSendComplete();
+    }
+    // File send button only available when connected AND a file is loaded
+    ui->sendFileButton->setEnabled(isOpen && !ui->filePathLineEdit->text().isEmpty());
 }
 
 void MainWindow::onSerialError(const QString &message) {
@@ -323,6 +423,14 @@ void MainWindow::appendToLog(const QString &direction, const QByteArray &data) {
                 "<span style='color:%2;font-weight:bold'>%3</span>&nbsp;%4")
             .arg(ts, color, direction, shown.toHtmlEscaped())
         );
+
+    // Store entry so snapshot save has the full history
+    LogEntry entry{ QDateTime::currentDateTime(), direction, data };
+    m_logEntries.append(entry);
+    ui->entryCountLabel->setText(QString("%1 entries").arg(m_logEntries.size()));
+
+    // Forward to FileManager if auto-logging is active
+    m_fileManager->logEntry(direction, data, entry.timestamp, currentDisplayFormat());
 }
 
 // [P2] Read current format selection from the combo boxes
@@ -331,4 +439,163 @@ DataConverter::Format MainWindow::currentSendFormat() const {
 }
 DataConverter::Format MainWindow::currentDisplayFormat() const {
     return DataConverter::formatFromIndex(ui->displayFormatComboBox->currentIndex());
+}
+
+void MainWindow::onAutoLogToggled() {
+    if (m_fileManager->isLogging()) {
+        m_fileManager->stopLogging();    // triggers onLoggingStopped via signal
+        return;
+    }
+    QString defaultName = QDir::homePath() + "/autolog_" +
+                          QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss");
+    QString path = QFileDialog::getSaveFileName(
+        this, "Auto-Log File", defaultName,
+        "Text Files (*.txt);;CSV Files (*.csv);;All Files (*)");
+    if (path.isEmpty()) { ui->autoLogButton->setChecked(false); return; }
+
+    bool append = false;
+    if (QFile::exists(path)) {
+        // Custom dialog so user can choose between Append and Overwrite explicitly
+        QMessageBox msgBox(this);
+        msgBox.setWindowTitle("File Exists");
+        msgBox.setText("'" + QFileInfo(path).fileName() + "' already exists.");
+        QPushButton *btnAppend    = msgBox.addButton("Append",    QMessageBox::AcceptRole);
+        QPushButton *btnOverwrite = msgBox.addButton("Overwrite", QMessageBox::DestructiveRole);
+        msgBox.addButton("Cancel", QMessageBox::RejectRole);
+        msgBox.exec();
+        if      (msgBox.clickedButton() == btnAppend)    append = true;
+        else if (msgBox.clickedButton() == btnOverwrite) append = false;
+        else { ui->autoLogButton->setChecked(false); return; }
+    }
+
+    FileManager::LogFormat fmt = path.endsWith(".csv", Qt::CaseInsensitive)
+                                     ? FileManager::LogFormat::CSV
+                                     : FileManager::LogFormat::PlainText;
+
+    if (!m_fileManager->startLogging(path, fmt, append))
+        ui->autoLogButton->setChecked(false); // triggers onLoggingStarted on success
+}
+
+void MainWindow::onLoggingStarted(const QString &path) {
+    ui->autoLogButton->setText("Stop Auto-Log");
+    ui->autoLogButton->setChecked(true);
+    ui->logStatusLabel->setStyleSheet("color: green; font-weight: bold;");
+    ui->logStatusLabel->setText("● Logging: " + QFileInfo(path).fileName());
+}
+
+void MainWindow::onLoggingStopped() {
+    ui->autoLogButton->setText("Start Auto-Log");
+    ui->autoLogButton->setChecked(false);
+    ui->logStatusLabel->setStyleSheet("color: gray;");
+    ui->logStatusLabel->setText("● Not logging");
+}
+
+void MainWindow::onBrowseFileClicked() {
+    QString path = QFileDialog::getOpenFileName(
+        this, "Select File to Send", QDir::homePath(),
+        "All Files (*);;Text Files (*.txt *.csv *.log);;Binary Files (*.bin *.hex *.dat)");
+    if (path.isEmpty()) return;
+    ui->filePathLineEdit->setText(path);
+    ui->sendFileButton->setEnabled(m_serial->isOpen());
+    updateFilePreview();
+}
+
+void MainWindow::updateFilePreview() {
+    const QString path = ui->filePathLineEdit->text();
+    if (path.isEmpty()) { ui->filePreviewLabel->setText("—"); return; }
+
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly)) {
+        ui->filePreviewLabel->setText("Could not read file.");
+        return;
+    }
+    bool isText = (ui->fileModeComboBox->currentIndex() == 0);
+    QString preview;
+    if (isText) {
+        QTextStream stream(&file);
+        QStringList lines;
+        for (int i = 0; i < 2 && !stream.atEnd(); i++)
+            lines << stream.readLine();
+        preview = lines.join(" ↵ ");
+    } else {
+        QByteArray bytes = file.read(16);
+        preview = "HEX: " + QString::fromLatin1(bytes.toHex(' ').toUpper());
+    }
+    // Truncate long previews so label doesn't stretch the window
+    ui->filePreviewLabel->setText(
+        preview.length() > 100 ? preview.left(97) + "..." : preview);
+}
+
+void MainWindow::onFileModeChanged(int /*index*/) {
+    // Re-render preview with new interpretation (text vs binary) if file is loaded
+    updateFilePreview();
+}
+
+void MainWindow::onFileSendModeChanged(int index) {
+    // Show interval controls only in "Line by line" mode
+    const bool lineByLine = (index == 1);
+    ui->fileSendIntervalLabel->setVisible(lineByLine);
+    ui->fileSendIntervalSpinBox->setVisible(lineByLine);
+}
+
+void MainWindow::onSendFileClicked() {
+    if (!m_serial->isOpen()) {
+        statusBar()->showMessage("Not connected.", 2000); return;
+    }
+
+    FileManager::FileMode fileMode = (ui->fileModeComboBox->currentIndex() == 0)
+                                         ? FileManager::FileMode::Text
+                                         : FileManager::FileMode::Binary;
+
+    if (!m_fileManager->loadFile(ui->filePathLineEdit->text(), fileMode)) {
+        QMessageBox::critical(this, "Load Failed",
+                              "Could not read the file. Check it exists and is not locked.");
+        return;
+    }
+
+    const bool lineByLine = (ui->sendModeComboBox->currentIndex() == 1);
+
+    if (!lineByLine) {
+        // ── All at once ──────────────────────────────────────────────────
+        QByteArray data = m_fileManager->allBytes();
+        m_serial->sendBytes(data);
+        statusBar()->showMessage(
+            QString("File sent: %1 bytes").arg(data.size()), 3000);
+        return;
+    }
+
+    // ── Line by line ─────────────────────────────────────────────────────
+    ui->sendFileButton->setEnabled(false);
+    ui->stopFileSendButton->setEnabled(true);
+    ui->fileSendProgressBar->setMaximum(m_fileManager->totalLines());
+    ui->fileSendProgressBar->setValue(0);
+    ui->fileSendProgressBar->setVisible(true);
+    m_fileSendTimer->start(ui->fileSendIntervalSpinBox->value());
+}
+
+void MainWindow::onFileSendTick() {
+    if (!m_fileManager->hasMoreLines()) {
+        m_fileSendTimer->stop();
+        onFileSendComplete();
+        return;
+    }
+    m_serial->sendBytes(m_fileManager->nextLine());
+    ui->fileSendProgressBar->setValue(m_fileManager->currentLine());
+    statusBar()->showMessage(
+        QString("Sending file: %1 / %2 lines")
+            .arg(m_fileManager->currentLine())
+            .arg(m_fileManager->totalLines()));
+}
+
+void MainWindow::onStopFileSendClicked() {
+    m_fileSendTimer->stop();
+    onFileSendComplete();
+    statusBar()->showMessage("File send stopped.", 2000);
+}
+
+void MainWindow::onFileSendComplete() {
+    ui->sendFileButton->setEnabled(m_serial->isOpen());
+    ui->stopFileSendButton->setEnabled(false);
+    ui->fileSendProgressBar->setVisible(false);
+    statusBar()->showMessage("File send complete.", 3000);
 }
